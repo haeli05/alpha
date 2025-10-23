@@ -14,6 +14,12 @@ Event‑driven trading system with a Next.js monitoring UI, supporting CEX/DeFi.
 - Backtest data downloader for Binance CSV klines
 - Simple SMA‑crossover backtest runner (TS)
 - Paper trading demo (market orders at last price) with REST endpoints
+- Live markets page updates via Binance WebSocket
+- Symbol chart overlays: EMA20/EMA50, Bollinger Bands (20,2), RSI(14) + volume pane
+- Strategy SDK and backtest engine scaffold (TS)
+- Execution adapters:
+  - CEX: Binance REST (signed) with idempotency key generation
+  - DeFi: viem-based simulate + send (scaffold)
 
 ## Quickstart
 
@@ -42,9 +48,10 @@ npm start
   - Renders sparkline, last price, 24h change, and volume.
 
 - Symbol page: `apps/next-monitor/app/markets/[symbol]/page.tsx`
-  - TradingView lightweight‑charts candlesticks from `apps/next-monitor/components/CandlesChart.tsx`
+  - TradingView lightweight‑charts via `apps/next-monitor/components/AdvancedChart.tsx`
   - 24h stats: last price, 24h change, high/low, quote volume
   - Paper trading panel (demo): buy/sell at current WS last price and track PnL
+  - Overlays: EMA20/EMA50, Bollinger Bands, RSI(14) and volume histogram
 
 ## Backtesting Toolkit (TypeScript)
 
@@ -96,10 +103,11 @@ Use `apps/next-monitor/scripts/run-backtest.ts` as a guide. The core concepts:
 
 Steps to add a new strategy:
 
-1. Create a new script (e.g., `scripts/run-mystrategy.ts`) and import the CSV loader from `run-backtest.ts`.
-2. Implement indicators (SMA/EMA/RSI/etc.).
-3. In your loop, compute signals and create trades similar to `runSmaCross`.
-4. Print metrics (total PnL, win rate, max DD, Sharpe, etc.).
+1. Create a new script (e.g., `scripts/run-mystrategy.ts`) and import the engine from `@/lib/strategy/core`.
+2. Implement a `Strategy` with `onCandle(ctx, candles)` returning `buy` | `sell` | `hold`.
+3. Use indicators from `@/lib/indicators`.
+4. Run with `runBacktest(candles, strategy, { initialEquity: 10000, feeBps: 1, slippageBps: 1 })`.
+5. Print metrics (total PnL, win rate, max DD, Sharpe, etc.).
 
 Tip: Keep your strategy logic independent from the data loader so you can reuse it in live trading later.
 
@@ -135,12 +143,67 @@ curl -X POST http://localhost:3000/api/paper/orders \
 
 ## Roadmap (next steps)
 
-- Live updates via WebSocket for ticker and new candles
-- More charts (volume, indicators, overlays) and multi-timeframe
+- Live 15m candle aggregation and streaming to UI
+- Indicator toggles and multi-timeframe support
 - Per‑strategy dashboards (PnL, drawdown, win‑rate, latency)
-- Strategy SDK: shared interface for backtest + live, with adapters
-- Execution services: CEX/DeFi executors, risk checks, kill switches
-- Persistence: TimescaleDB or ClickHouse for ticks/fills, and event bus
+- Strategy SDK: add orders/position sizing, multi-asset portfolio
+- Execution services: CEX/DeFi executors integrated via API routes (server-only), risk checks, kill switches
+- Persistence: TimescaleDB/ClickHouse and NATS/Kafka for events
+- Secrets: Vault/KMS integration and per-service short‑lived creds
 
 If you want, I can start wiring a backend service for order routing and a simple risk layer next, then expose it to the UI.
 Trading bot
+## CEX Execution (Binance REST) — Experimental
+
+Env (copy `.env.local.example` to `.env.local` under `apps/next-monitor`):
+
+```
+BINANCE_API_KEY=...
+BINANCE_API_SECRET=...
+BINANCE_BASE_URL=https://api.binance.com
+ENABLE_LIVE_TRADING=false
+MAX_NOTIONAL_PER_ORDER=100
+ALLOWED_SYMBOLS=BTCUSDT,ETHUSDT
+```
+
+Usage (server-side scripts or API routes only — do not expose keys to client):
+
+```ts
+import { accountInfo, newOrder } from '@/lib/execution/binance';
+
+const acct = await accountInfo();
+const res = await newOrder({ symbol: 'BTCUSDT', side: 'BUY', type: 'MARKET', quoteOrderQty: 100 });
+```
+
+Note: Includes idempotency via `newClientOrderId`. Add external persistence for full safety and rate‑limit tracking in production.
+
+API route for convenience (disabled unless `ENABLE_LIVE_TRADING=true`):
+
+```
+POST /api/binance/order
+{ "symbol":"BTCUSDT", "side":"BUY", "type":"MARKET", "quoteOrderQty":100 }
+```
+Respects `MAX_NOTIONAL_PER_ORDER` and `ALLOWED_SYMBOLS`.
+
+## DeFi Execution (viem) — Scaffold
+
+Env:
+
+```
+RPC_URL_MAINNET=...
+PRIVATE_KEY_MAINNET=0x...
+```
+
+Usage:
+
+```ts
+import { simulateAndSend } from '@/lib/execution/defi';
+
+await simulateAndSend({
+  cfg: { rpcUrl: process.env.RPC_URL_MAINNET!, privateKey: process.env.PRIVATE_KEY_MAINNET as `0x${string}` },
+  to: '0xE592427A0AEce92De3Edee1F18E0157C05861564', // Uniswap V3 Router
+  data: '0x...', // calldata from your router/aggregator with slippage constraints
+});
+```
+
+Recommendation: Use an aggregator (0x/1inch/CoW) or Uniswap SO Router to produce calldata, then simulate with viem before sending.

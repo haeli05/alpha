@@ -9,8 +9,8 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-
-type Candle = { ts: number; open: number; high: number; low: number; close: number; volume: number };
+import { ema, rsi } from '@/lib/indicators';
+import { Candle, runBacktest, Strategy } from '@/lib/strategy/core';
 
 function arg(name: string, def?: string): string | undefined {
   const idx = process.argv.indexOf(`--${name}`);
@@ -47,54 +47,6 @@ function loadCandles(dir: string): Candle[] {
   return rows;
 }
 
-function sma(values: number[], period: number): number[] {
-  const out: number[] = [];
-  let sum = 0;
-  for (let i = 0; i < values.length; i++) {
-    sum += values[i];
-    if (i >= period) sum -= values[i - period];
-    out.push(i + 1 >= period ? sum / period : NaN);
-  }
-  return out;
-}
-
-type Trade = { entryTs: number; entry: number; exitTs: number; exit: number; pnl: number };
-
-function runSmaCross(candles: Candle[], fast: number, slow: number) {
-  const closes = candles.map((c) => c.close);
-  const f = sma(closes, fast);
-  const s = sma(closes, slow);
-  let position: 'long' | null = null;
-  let entry = 0;
-  let entryTs = 0;
-  const trades: Trade[] = [];
-  for (let i = 1; i < candles.length; i++) {
-    if (!Number.isFinite(f[i]) || !Number.isFinite(s[i]) || !Number.isFinite(f[i - 1]) || !Number.isFinite(s[i - 1])) continue;
-    const crossUp = f[i] >= s[i] && f[i - 1] < s[i - 1];
-    const crossDn = f[i] <= s[i] && f[i - 1] > s[i - 1];
-    if (!position && crossUp) {
-      position = 'long';
-      entry = candles[i].close;
-      entryTs = candles[i].ts;
-    } else if (position === 'long' && crossDn) {
-      const exit = candles[i].close;
-      const pnl = (exit - entry) / entry;
-      trades.push({ entryTs, entry, exitTs: candles[i].ts, exit, pnl });
-      position = null;
-    }
-  }
-  // Close any open position at last candle
-  if (position === 'long') {
-    const last = candles[candles.length - 1];
-    trades.push({ entryTs, entry, exitTs: last.ts, exit: last.close, pnl: (last.close - entry) / entry });
-  }
-  const totalPnl = trades.reduce((a, t) => a + t.pnl, 0);
-  const wins = trades.filter((t) => t.pnl > 0).length;
-  const losses = trades.filter((t) => t.pnl <= 0).length;
-  const winRate = trades.length ? (wins / trades.length) * 100 : 0;
-  return { trades, totalPnl, winRate };
-}
-
 async function main() {
   const symbol = (arg('symbol') || '').toUpperCase();
   const interval = arg('interval') || '15m';
@@ -109,13 +61,32 @@ async function main() {
     console.error('Data not found:', dir);
     process.exit(1);
   }
-  const candles = loadCandles(dir);
-  const { trades, totalPnl, winRate } = runSmaCross(candles, smaFast, smaSlow);
-  console.log(JSON.stringify({ symbol, interval, candles: candles.length, trades: trades.length, totalPnl, winRate }, null, 2));
+  const candles = loadCandles(dir) as Candle[];
+  // Example strategy: SMA cross + RSI filter
+  const strat: Strategy = {
+    name: 'SMA_CROSS_RSI',
+    onCandle(ctx, all) {
+      const closes = all.map(c => c.close);
+      const f = ema(closes, smaFast);
+      const s = ema(closes, smaSlow);
+      const r = rsi(closes, 14);
+      const i = ctx.index;
+      if (!(Number.isFinite(f[i]) && Number.isFinite(s[i]) && Number.isFinite(f[i-1]) && Number.isFinite(s[i-1]) && Number.isFinite(r[i]))) {
+        return 'hold';
+      }
+      const crossUp = f[i] >= s[i] && f[i - 1] < s[i - 1];
+      const crossDn = f[i] <= s[i] && f[i - 1] > s[i - 1];
+      if (ctx.position === 0 && crossUp && r[i] > 50) return 'buy';
+      if (ctx.position > 0 && crossDn) return 'sell';
+      return 'hold';
+    }
+  };
+
+  const res = runBacktest(candles, strat, { initialEquity: 10000, feeBps: 1, slippageBps: 1 });
+  console.log(JSON.stringify({ symbol, interval, candles: candles.length, trades: res.trades.length, totalPnl: res.totalPnl, winRate: res.winRate }, null, 2));
 }
 
 main().catch((e) => {
   console.error(e);
   process.exit(1);
 });
-
