@@ -51,6 +51,16 @@ export function bollinger(values: Num[], period: number, mult: number) {
   return { middle: m, upper, lower };
 }
 
+// Alias for bollingerBands (returns array of objects for easier use)
+export function bollingerBands(values: Num[], period: number, mult: number): { upper: number; middle: number; lower: number }[] {
+  const { middle, upper, lower } = bollinger(values, period, mult);
+  return middle.map((m, i) => ({
+    upper: upper[i],
+    middle: m,
+    lower: lower[i],
+  }));
+}
+
 export function rsi(values: Num[], period: number): Num[] {
   const out: Num[] = new Array(values.length).fill(NaN);
   let avgGain = 0;

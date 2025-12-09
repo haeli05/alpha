@@ -3,6 +3,7 @@ import { displayPair, MAJOR_BINANCE_SYMBOLS } from '@/lib/markets';
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { bollinger, ema, rsi } from '@/lib/indicators';
+import { toChartTime, type ChartCandle, type ChartLinePoint } from '@/lib/types';
 
 const Chart = dynamic(() => import('@/components/AdvancedChart'), { ssr: false });
 const TradePanel = dynamic(() => import('./TradePanel'), { ssr: false });
@@ -13,15 +14,16 @@ type Props = { params: { symbol: string } };
 
 export default async function SymbolPage({ params }: Props) {
   const symbol = params.symbol.toUpperCase();
-  const isKnown = MAJOR_BINANCE_SYMBOLS.includes(symbol as any);
+  const isKnown = (MAJOR_BINANCE_SYMBOLS as readonly string[]).includes(symbol);
+
   const [klines, ticker] = await Promise.all([
     fetchKlines(symbol, '15m', 192),
     fetch24hTicker(symbol),
   ]);
+
   const closes = klines.map((k) => k.close);
-  const volumes = klines.map((k) => k.volume);
-  const candles = klines.map((k) => ({
-    time: Math.floor(k.openTime / 1000) as any,
+  const candles: ChartCandle[] = klines.map((k) => ({
+    time: toChartTime(k.openTime),
     open: k.open,
     high: k.high,
     low: k.low,
@@ -29,13 +31,28 @@ export default async function SymbolPage({ params }: Props) {
     volume: k.volume,
   }));
 
-  // Indicators
-  const ema20 = ema(closes, 20).map((v, i) => ({ time: candles[i].time as any, value: v }));
-  const ema50 = ema(closes, 50).map((v, i) => ({ time: candles[i].time as any, value: v }));
+  // Indicators with proper types
+  const ema20: ChartLinePoint[] = ema(closes, 20).map((v, i) => ({
+    time: candles[i].time,
+    value: v,
+  }));
+  const ema50: ChartLinePoint[] = ema(closes, 50).map((v, i) => ({
+    time: candles[i].time,
+    value: v,
+  }));
   const bb = bollinger(closes, 20, 2);
-  const bbUpper = bb.upper.map((v, i) => ({ time: candles[i].time as any, value: v }));
-  const bbLower = bb.lower.map((v, i) => ({ time: candles[i].time as any, value: v }));
-  const rsi14 = rsi(closes, 14).map((v, i) => ({ time: candles[i].time as any, value: v }));
+  const bbUpper: ChartLinePoint[] = bb.upper.map((v, i) => ({
+    time: candles[i].time,
+    value: v,
+  }));
+  const bbLower: ChartLinePoint[] = bb.lower.map((v, i) => ({
+    time: candles[i].time,
+    value: v,
+  }));
+  const rsi14: ChartLinePoint[] = rsi(closes, 14).map((v, i) => ({
+    time: candles[i].time,
+    value: v,
+  }));
 
   return (
     <div style={{ display: 'grid', gap: 12 }}>
@@ -59,7 +76,7 @@ export default async function SymbolPage({ params }: Props) {
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 360px', gap: 16 }}>
         <div style={{ border: '1px solid #eee', borderRadius: 8, padding: 8 }}>
-          <Chart candles={candles as any} ema20={ema20 as any} ema50={ema50 as any} bbUpper={bbUpper as any} bbLower={bbLower as any} rsi14={rsi14 as any} height={480} />
+          <Chart candles={candles} ema20={ema20} ema50={ema50} bbUpper={bbUpper} bbLower={bbLower} rsi14={rsi14} height={480} />
         </div>
         <TradePanel symbol={symbol} lastPrice={Number(ticker.lastPrice)} />
       </div>

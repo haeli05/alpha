@@ -1,3 +1,5 @@
+import { logger } from '@/lib/logger';
+
 export type Interval =
   | '1m' | '3m' | '5m' | '15m' | '30m'
   | '1h' | '2h' | '4h' | '6h' | '8h' | '12h'
@@ -13,6 +15,22 @@ export interface Kline {
   closeTime: number; // ms
 }
 
+// Raw kline response from Binance API
+type KlineRaw = [
+  number,   // 0: Open time
+  string,   // 1: Open
+  string,   // 2: High
+  string,   // 3: Low
+  string,   // 4: Close
+  string,   // 5: Volume
+  number,   // 6: Close time
+  string,   // 7: Quote asset volume
+  number,   // 8: Number of trades
+  string,   // 9: Taker buy base asset volume
+  string,   // 10: Taker buy quote asset volume
+  string,   // 11: Ignore
+];
+
 // Fetch klines from Binance REST. Defaults to 15m.
 export async function fetchKlines(
   symbol: string,
@@ -24,10 +42,13 @@ export async function fetchKlines(
 
   const res = await fetch(url, { next: { revalidate: 30 } });
   if (!res.ok) {
+    logger.error('Binance', `Klines error ${res.status} for ${symbol}`);
     throw new Error(`Binance klines error ${res.status} for ${symbol}`);
   }
-  const raw = (await res.json()) as any[];
-  return raw.map((r) => ({
+
+  const raw: KlineRaw[] = await res.json();
+
+  return raw.map((r): Kline => ({
     openTime: r[0],
     open: parseFloat(r[1]),
     high: parseFloat(r[2]),
