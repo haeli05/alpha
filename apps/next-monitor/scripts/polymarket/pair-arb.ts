@@ -36,7 +36,7 @@ dotenv.config({ path: resolve(process.cwd(), '.env.local') });
 dotenv.config({ path: resolve(process.cwd(), '.env') });
 
 import crypto from 'crypto';
-import { addTrade, updateTrade, getTrades } from '../../lib/pairArbStore';
+import { addTrade, updateTrade, getTrades, cancelPendingTradesForMarket } from '../../lib/pairArbStore';
 import { Wallet } from '@ethersproject/wallet';
 
 // Dynamic import for ClobClient to handle build issues
@@ -1269,6 +1269,12 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
         
         // Cancel all open orders before switching
         await cancelAllOpenOrders(clobClient);
+        
+        // Cancel pending trades in our store (unless one leg already executed)
+        const cancelledCount = cancelPendingTradesForMarket(currentMarketSlug);
+        if (cancelledCount > 0) {
+          log(`Cancelled ${cancelledCount} pending trade(s) for ${currentMarketSlug}`, 'INFO');
+        }
         
         if (USE_DYNAMIC_MARKET) {
           // Generate next hour's market slug

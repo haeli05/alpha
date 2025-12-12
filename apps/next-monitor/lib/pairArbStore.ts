@@ -126,6 +126,41 @@ export function getTradeStats(): {
   };
 }
 
+/**
+ * Cancel all pending trades for a market, unless one leg is already executed
+ * Returns the number of trades cancelled
+ */
+export function cancelPendingTradesForMarket(marketSlug: string): number {
+  const store = readStore();
+  let cancelledCount = 0;
+  
+  for (const trade of store.trades) {
+    // Only process trades for this market that are still open
+    if (trade.marketSlug !== marketSlug || trade.status !== 'open') {
+      continue;
+    }
+    
+    // Check if at least one leg has been executed
+    const hasYesFilled = !!trade.yesFilledAt;
+    const hasNoFilled = !!trade.noFilledAt;
+    
+    // If neither leg is filled, cancel the trade
+    if (!hasYesFilled && !hasNoFilled) {
+      trade.status = 'cancelled';
+      trade.notes = (trade.notes || '') + ' | Cancelled on market switch';
+      cancelledCount++;
+    }
+    // If one leg is filled but not the other, keep it open (partial fill)
+    // These trades need manual attention or will be handled at settlement
+  }
+  
+  if (cancelledCount > 0) {
+    writeStore(store);
+  }
+  
+  return cancelledCount;
+}
+
 
 
 
