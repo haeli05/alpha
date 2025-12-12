@@ -222,12 +222,24 @@ async function sleep(ms: number): Promise<void> {
 }
 
 /**
- * displayTradePairsTable: Display a table of all trade pairs
+ * displayTradePairsTable: Display a table of active trade pairs for current market
+ * Only shows open/filled trades for the current market (excludes cancelled/failed and old markets)
  * @param currentMarketSlug - Current market being traded (optional)
  */
 function displayTradePairsTable(currentMarketSlug?: string) {
-  const trades = getTrades({ limit: 20 }); // Get last 20 trades
-  const openTrades = trades.filter(t => t.status === 'open');
+  const allTrades = getTrades({ limit: 100 });
+  
+  // Filter to only show relevant trades:
+  // 1. Open or filled status (exclude cancelled/failed)
+  // 2. For current market only (if provided)
+  const relevantTrades = allTrades.filter(t => {
+    const isActiveStatus = t.status === 'open' || t.status === 'filled';
+    const isCurrentMarket = !currentMarketSlug || t.marketSlug === currentMarketSlug;
+    return isActiveStatus && isCurrentMarket;
+  });
+  
+  const openTrades = relevantTrades.filter(t => t.status === 'open');
+  const filledTrades = relevantTrades.filter(t => t.status === 'filled');
   
   // Table header with current market info
   console.log('┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐');
@@ -242,14 +254,14 @@ function displayTradePairsTable(currentMarketSlug?: string) {
   console.log('│   ID     │      Market           │  YES Price   │  NO Price    │ YES Executed │ NO Executed  │    Status    │ Size │');
   console.log('├──────────┼──────────────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────────────┼──────┤');
   
-  if (trades.length === 0) {
-    console.log('│  No trades yet                                                                                              │');
+  if (relevantTrades.length === 0) {
+    console.log('│  No active trades for this market                                                                           │');
     console.log('└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘');
     return;
   }
   
   // Display trades (most recent first, limit to 10 for readability)
-  const displayTrades = trades.slice(0, 10);
+  const displayTrades = relevantTrades.slice(0, 10);
   for (const trade of displayTrades) {
     const id = trade.id.slice(-6); // Last 6 chars of ID
     const market = trade.marketSlug.length > 20 ? trade.marketSlug.slice(0, 17) + '...' : trade.marketSlug;
@@ -266,22 +278,15 @@ function displayTradePairsTable(currentMarketSlug?: string) {
       statusDisplay = `✅ ${status}`;
     } else if (trade.status === 'open') {
       statusDisplay = `🟡 ${status}`;
-    } else if (trade.status === 'failed' || trade.status === 'cancelled') {
-      statusDisplay = `❌ ${status}`;
     }
     
-    // Highlight current market
-    const marketDisplay = (currentMarketSlug && trade.marketSlug === currentMarketSlug) 
-      ? `▶ ${market}`.padEnd(20)
-      : market.padEnd(20);
-    
     console.log(
-      `│ ${id.padEnd(8)} │ ${marketDisplay} │ ${yesPrice.padEnd(12)} │ ${noPrice.padEnd(12)} │ ${yesExecuted.padEnd(12)} │ ${noExecuted.padEnd(12)} │ ${statusDisplay.padEnd(12)} │ ${size.padEnd(4)} │`
+      `│ ${id.padEnd(8)} │ ${market.padEnd(20)} │ ${yesPrice.padEnd(12)} │ ${noPrice.padEnd(12)} │ ${yesExecuted.padEnd(12)} │ ${noExecuted.padEnd(12)} │ ${statusDisplay.padEnd(12)} │ ${size.padEnd(4)} │`
     );
   }
   
   console.log('├──────────┴──────────────────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────────────┴──────┤');
-  console.log(`│  Total Trades: ${trades.length}  │  Open: ${openTrades.length}  │  Filled: ${trades.filter(t => t.status === 'filled').length}  │`);
+  console.log(`│  Active Trades: ${relevantTrades.length}  │  Open: ${openTrades.length}  │  Filled: ${filledTrades.length}  │`);
   console.log('└─────────────────────────────────────────────────────────────────────────────────────────────────────────────┘');
 }
 
