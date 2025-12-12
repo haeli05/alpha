@@ -16,7 +16,7 @@
     "format": "prettier --write \"**/*.{ts,tsx,json,md}\""
   },
   "dependencies": {
-    "@polymarket/clob-client": "github:polymarket/clob-client",
+    "@polymarket/clob-client": "^5.1.0",
     "@tanstack/react-query": "^5.90.11",
     "lightweight-charts": "^4.2.0",
     "next": "^14.2.5",
@@ -34,9 +34,11 @@
     "@types/react": "^18.2.66",
     "@types/react-dom": "^18.2.22",
     "@vitest/ui": "^4.0.14",
+    "dotenv": "^17.2.3",
     "eslint": "^9.39.1",
     "eslint-config-next": "^16.0.4",
     "jsdom": "^27.2.0",
+    "make": "^0.8.1",
     "prettier": "^3.6.2",
     "tsx": "^4.19.2",
     "typescript": "^5.4.5",
