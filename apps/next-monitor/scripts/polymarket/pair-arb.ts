@@ -36,8 +36,41 @@ dotenv.config({ path: resolve(process.cwd(), '.env.local') });
 dotenv.config({ path: resolve(process.cwd(), '.env') });
 
 import crypto from 'crypto';
-import { addTrade, updateTrade, getTrades, cancelPendingTradesForMarket } from '../../lib/pairArbStore';
+import WebSocket from 'ws';
+import { addTrade, updateTrade, getTrades, cancelPendingTradesForMarket, getPartiallyFilledTrades, areAllTradesFullyHedged, isYesFirstFullyHedged, isNoFirstFullyHedged, markHedgeFilled, getTotalPnL } from '../../lib/pairArbStore';
 import { Wallet } from '@ethersproject/wallet';
+
+// ============================================================================
+// WEBSOCKET CONFIGURATION
+// ============================================================================
+
+const WS_URL = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
+
+// Real-time price state (updated by WebSocket)
+interface PriceState {
+  yesPrice: number;
+  noPrice: number;
+  yesBestBid: number;
+  yesBestAsk: number;
+  noBestBid: number;
+  noBestAsk: number;
+  lastUpdate: number;
+}
+
+let priceState: PriceState = {
+  yesPrice: 0,
+  noPrice: 0,
+  yesBestBid: 0,
+  yesBestAsk: 0,
+  noBestBid: 0,
+  noBestAsk: 0,
+  lastUpdate: 0,
+};
+
+let wsConnection: WebSocket | null = null;
+let wsReconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 10;
+const RECONNECT_DELAY_MS = 5000;
 
 // Dynamic import for ClobClient to handle build issues
 let ClobClient: any;
@@ -112,10 +145,17 @@ const MARKET_REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 const TRAILING_STOP_CENTS = 0.02; // 2 cents
 
 /**
- * SHARE_SIZE: Number of shares to trade per cycle
+ * TARGET_SPREAD_CENTS: Target profit spread in cents
+ * Hedge leg is placed at (1 - firstPrice - spread) to capture this profit
  */
-const DEFAULT_TARGET_NOTIONAL_PER_LEG = 1; // USD per leg if env not set
-const TARGET_NOTIONAL_PER_LEG = parseFloat(process.env.PAIR_ARB_TARGET_NOTIONAL_PER_LEG || '') || DEFAULT_TARGET_NOTIONAL_PER_LEG;
+const TARGET_SPREAD_CENTS = 0.05; // 5 cents profit target
+
+/**
+ * SHARE_SIZE: Number of shares to trade per leg (YES and NO)
+ * Set to 5 for standardized position sizing
+ */
+const DEFAULT_SHARE_SIZE = 5; // 5 shares per leg
+const SHARE_SIZE = parseFloat(process.env.PAIR_ARB_SHARE_SIZE || '') || DEFAULT_SHARE_SIZE;
 
 /**
  * TRADE_MODE: Trading mode
@@ -135,6 +175,13 @@ const TRADE_DIRECTION: 'YES_FIRST' | 'NO_FIRST' = 'YES_FIRST';
  * LOOP_INTERVAL_MS: Time between strategy cycles (milliseconds)
  */
 const LOOP_INTERVAL_MS = 1000; // 1 second
+
+/**
+ * MAX_LOSS_USD: Stop trading if total profit drops below this threshold
+ * Set to negative value (e.g., -10 means stop if we lose $10)
+ * Set to null to disable stop loss
+ */
+const MAX_LOSS_USD: number | null = -10; // Stop if we lose $10
 
 // ============================================================================
 // API ENDPOINTS
@@ -219,6 +266,229 @@ function log(message: string, level: 'INFO' | 'WARN' | 'ERROR' | 'TRADE' = 'INFO
  */
 async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ============================================================================
+// WEBSOCKET FUNCTIONS
+// ============================================================================
+
+let currentYesTokenId: string = '';
+let currentNoTokenId: string = '';
+
+/**
+ * Connect to Polymarket WebSocket for real-time price updates
+ */
+function connectWebSocket(yesTokenId: string, noTokenId: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    currentYesTokenId = yesTokenId;
+    currentNoTokenId = noTokenId;
+
+    log(`🔌 Connecting to WebSocket...`, 'INFO');
+    log(`   YES Token: ${yesTokenId.slice(0, 20)}...`, 'INFO');
+    log(`   NO Token:  ${noTokenId.slice(0, 20)}...`, 'INFO');
+
+    wsConnection = new WebSocket(WS_URL);
+
+    wsConnection.on('open', () => {
+      log(`✅ WebSocket connected!`, 'INFO');
+      wsReconnectAttempts = 0;
+
+      // Subscribe to both token price updates
+      const subscribeMsg = {
+        assets_ids: [yesTokenId, noTokenId],
+        type: 'market',
+      };
+
+      wsConnection?.send(JSON.stringify(subscribeMsg));
+      log(`📡 Subscribed to price updates for YES and NO tokens`, 'INFO');
+
+      // Start ping interval to keep connection alive
+      const pingInterval = setInterval(() => {
+        if (wsConnection?.readyState === WebSocket.OPEN) {
+          wsConnection.send('PING');
+        } else {
+          clearInterval(pingInterval);
+        }
+      }, 10000);
+
+      resolve();
+    });
+
+    wsConnection.on('message', (data: WebSocket.Data) => {
+      try {
+        const message = data.toString();
+
+        // Ignore PONG responses
+        if (message === 'PONG') return;
+
+        const parsed = JSON.parse(message);
+        handleWebSocketMessage(parsed);
+      } catch (error) {
+        // Ignore parse errors for non-JSON messages
+      }
+    });
+
+    wsConnection.on('error', (error) => {
+      log(`WebSocket error: ${error.message}`, 'ERROR');
+    });
+
+    wsConnection.on('close', () => {
+      log(`WebSocket disconnected`, 'WARN');
+
+      // Attempt reconnection
+      if (wsReconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+        wsReconnectAttempts++;
+        log(`Reconnecting in ${RECONNECT_DELAY_MS / 1000}s (attempt ${wsReconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, 'INFO');
+        setTimeout(() => {
+          connectWebSocket(currentYesTokenId, currentNoTokenId).catch(() => {});
+        }, RECONNECT_DELAY_MS);
+      } else {
+        log(`Max reconnection attempts reached. Falling back to REST API.`, 'ERROR');
+      }
+    });
+
+    // Timeout if connection takes too long
+    setTimeout(() => {
+      if (wsConnection?.readyState !== WebSocket.OPEN) {
+        reject(new Error('WebSocket connection timeout'));
+      }
+    }, 10000);
+  });
+}
+
+/**
+ * Handle incoming WebSocket messages
+ */
+function handleWebSocketMessage(message: any): void {
+  const eventType = message.event_type;
+
+  if (eventType === 'book') {
+    // Initial order book snapshot
+    handleBookMessage(message);
+  } else if (eventType === 'price_change') {
+    // Price update
+    handlePriceChangeMessage(message);
+  } else if (eventType === 'last_trade_price') {
+    // Trade executed
+    handleLastTradePriceMessage(message);
+  }
+}
+
+/**
+ * Handle book (order book snapshot) message
+ */
+function handleBookMessage(message: any): void {
+  const assetId = message.asset_id;
+  const bids = message.bids || [];
+  const asks = message.asks || [];
+
+  // Get best bid and ask
+  const bestBid = bids.length > 0 ? parseFloat(bids[0].price || bids[0][1] || '0') : 0;
+  const bestAsk = asks.length > 0 ? parseFloat(asks[0].price || asks[0][1] || '1') : 1;
+  const midPrice = (bestBid + bestAsk) / 2;
+
+  if (assetId === currentYesTokenId) {
+    priceState.yesPrice = midPrice;
+    priceState.yesBestBid = bestBid;
+    priceState.yesBestAsk = bestAsk;
+  } else if (assetId === currentNoTokenId) {
+    priceState.noPrice = midPrice;
+    priceState.noBestBid = bestBid;
+    priceState.noBestAsk = bestAsk;
+  }
+
+  priceState.lastUpdate = Date.now();
+}
+
+/**
+ * Handle price_change message
+ */
+function handlePriceChangeMessage(message: any): void {
+  const changes = message.price_changes || [];
+
+  for (const change of changes) {
+    const assetId = change.asset_id;
+    const bestBid = parseFloat(change.best_bid || '0');
+    const bestAsk = parseFloat(change.best_ask || '1');
+    const midPrice = (bestBid + bestAsk) / 2;
+
+    if (assetId === currentYesTokenId) {
+      priceState.yesPrice = midPrice;
+      priceState.yesBestBid = bestBid;
+      priceState.yesBestAsk = bestAsk;
+    } else if (assetId === currentNoTokenId) {
+      priceState.noPrice = midPrice;
+      priceState.noBestBid = bestBid;
+      priceState.noBestAsk = bestAsk;
+    }
+  }
+
+  priceState.lastUpdate = Date.now();
+}
+
+/**
+ * Handle last_trade_price message
+ */
+function handleLastTradePriceMessage(message: any): void {
+  const assetId = message.asset_id;
+  const price = parseFloat(message.price || '0');
+
+  if (assetId === currentYesTokenId && price > 0) {
+    priceState.yesPrice = price;
+  } else if (assetId === currentNoTokenId && price > 0) {
+    priceState.noPrice = price;
+  }
+
+  priceState.lastUpdate = Date.now();
+}
+
+/**
+ * Get current prices from WebSocket state (or fallback to REST API)
+ */
+async function getCurrentPrices(yesTokenId: string, noTokenId: string): Promise<{ yesPrice: number; noPrice: number }> {
+  // If WebSocket has recent data (within 5 seconds), use it
+  const isRecent = Date.now() - priceState.lastUpdate < 5000;
+
+  if (isRecent && priceState.yesPrice > 0 && priceState.noPrice > 0) {
+    return {
+      yesPrice: priceState.yesPrice,
+      noPrice: priceState.noPrice,
+    };
+  }
+
+  // Fallback to REST API
+  try {
+    const [yesPrice, noPrice] = await Promise.all([
+      getMidpoint(yesTokenId),
+      getMidpoint(noTokenId),
+    ]);
+
+    // Update state
+    priceState.yesPrice = yesPrice;
+    priceState.noPrice = noPrice;
+    priceState.lastUpdate = Date.now();
+
+    return { yesPrice, noPrice };
+  } catch (error) {
+    // Return last known prices if REST also fails
+    if (priceState.yesPrice > 0 && priceState.noPrice > 0) {
+      return {
+        yesPrice: priceState.yesPrice,
+        noPrice: priceState.noPrice,
+      };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Close WebSocket connection
+ */
+function closeWebSocket(): void {
+  if (wsConnection) {
+    wsConnection.close();
+    wsConnection = null;
+  }
 }
 
 /**
@@ -383,6 +653,127 @@ async function getClobMarket(conditionId: string): Promise<{ tokens: Token[] }> 
 }
 
 /**
+ * checkOrderFilled: Check if an order has been filled via CLOB API
+ *
+ * @param clobClient - CLOB client instance
+ * @param orderId - Order ID to check
+ * @returns { filled: boolean, sizeMatched: number }
+ */
+async function checkOrderFilled(
+  clobClient: any,
+  orderId: string
+): Promise<{ filled: boolean; sizeMatched: number }> {
+  try {
+    const order = await clobClient.getOrder(orderId);
+    if (!order) {
+      return { filled: false, sizeMatched: 0 };
+    }
+
+    const sizeMatched = parseFloat(order.size_matched || order.sizeMatched || '0');
+    const originalSize = parseFloat(order.original_size || order.size || '1');
+
+    // Consider filled if at least 95% matched (to handle rounding)
+    const filled = sizeMatched >= originalSize * 0.95;
+
+    return { filled, sizeMatched };
+  } catch (error) {
+    // If order not found, it might have been filled and removed
+    return { filled: false, sizeMatched: 0 };
+  }
+}
+
+/**
+ * checkAndUpdatePendingHedges: Check all pending hedge orders and update when filled
+ *
+ * @param clobClient - CLOB client instance
+ * @param marketSlug - Current market slug
+ * @returns Number of hedges that were filled
+ */
+async function checkAndUpdatePendingHedges(
+  clobClient: any,
+  marketSlug: string
+): Promise<number> {
+  const partialTrades = getPartiallyFilledTrades(marketSlug);
+
+  if (partialTrades.length === 0) {
+    return 0;
+  }
+
+  log(`Checking ${partialTrades.length} pending hedge order(s)...`, 'INFO');
+
+  let filledCount = 0;
+
+  for (const trade of partialTrades) {
+    // Determine which side is pending
+    const pendingSide = trade.yesFilledAt ? 'no' : 'yes';
+    const pendingOrderId = pendingSide === 'yes' ? trade.yesOrderId : trade.noOrderId;
+    const pendingTokenId = pendingSide === 'yes' ? trade.yesTokenId : trade.noTokenId;
+    const pendingPrice = pendingSide === 'yes' ? trade.yesPrice : trade.noPrice;
+
+    // If we have an order ID, check it directly
+    if (pendingOrderId) {
+      try {
+        const { filled, sizeMatched } = await checkOrderFilled(clobClient, pendingOrderId);
+
+        if (filled) {
+          log(`✅ HEDGE FILLED: Trade ${trade.id.slice(-6)} ${pendingSide.toUpperCase()} leg filled (${sizeMatched} shares)`, 'TRADE');
+          markHedgeFilled(trade.id, pendingSide);
+          filledCount++;
+        } else {
+          log(`⏳ Trade ${trade.id.slice(-6)} ${pendingSide.toUpperCase()} hedge still pending`, 'INFO');
+        }
+      } catch (error) {
+        log(`Error checking order ${pendingOrderId}: ${error}`, 'WARN');
+      }
+    } else {
+      // No order ID - try to find by checking open orders for this token/price
+      log(`Trade ${trade.id.slice(-6)} missing ${pendingSide} order ID - checking open orders...`, 'WARN');
+
+      try {
+        // Get all open orders
+        const openOrders = await clobClient.getOpenOrders();
+
+        if (openOrders && Array.isArray(openOrders)) {
+          // Look for an order matching this token and approximate price
+          const matchingOrder = openOrders.find((o: any) => {
+            const orderToken = o.asset_id || o.token_id;
+            const orderPrice = parseFloat(o.price || '0');
+            const priceMatch = Math.abs(orderPrice - pendingPrice) < 0.02; // Within 2 cents
+            return orderToken === pendingTokenId && priceMatch;
+          });
+
+          if (matchingOrder) {
+            const orderId = matchingOrder.id || matchingOrder.order_id;
+            log(`Found matching order: ${orderId}`, 'INFO');
+
+            // Update the trade with the order ID
+            updateTrade(trade.id, {
+              [pendingSide === 'yes' ? 'yesOrderId' : 'noOrderId']: orderId,
+            });
+
+            // Check if it's filled
+            const { filled, sizeMatched } = await checkOrderFilled(clobClient, orderId);
+            if (filled) {
+              log(`✅ HEDGE FILLED: Trade ${trade.id.slice(-6)} ${pendingSide.toUpperCase()} leg filled (${sizeMatched} shares)`, 'TRADE');
+              markHedgeFilled(trade.id, pendingSide);
+              filledCount++;
+            }
+          } else {
+            // No open order found - might already be filled, check position
+            log(`No open order found for ${pendingSide.toUpperCase()} @ $${pendingPrice.toFixed(2)}`, 'WARN');
+            log(`   Trade may need manual verification or the hedge order failed`, 'WARN');
+          }
+        }
+      } catch (error) {
+        log(`Error searching open orders: ${error}`, 'WARN');
+      }
+    }
+  }
+
+  return filledCount;
+}
+
+/**
  * getOrderBook: Fetch order book for a specific token
  *
  * @param tokenId - Token ID to get order book for
@@ -474,18 +865,17 @@ async function executeTradePair(
     }
 
     log(`TRAILING STOP TRIGGERED (${direction}) - Executing ${monitorTokenName} AGGRESSIVE BUY...`, 'TRADE');
-    
-    const targetNotional = TARGET_NOTIONAL_PER_LEG;
-    log(`Target notional: $${targetNotional.toFixed(4)}`, 'INFO');
+
+    log(`Share size per leg: ${SHARE_SIZE} shares`, 'INFO');
 
     // === FIRST LEG: MARKET ORDER (guaranteed fill) ===
-    let firstResult: { price: number; orderId: string | null; filledSize: number };
+    let firstResult: { price: number; orderId: string | null; filledSize: number; filled: boolean };
     try {
       firstResult = await executeAggressiveBuy(
         clobClient,
         monitorToken.token_id,
         monitorTokenName,
-        targetNotional,
+        SHARE_SIZE,
         marketInfo
       );
     } catch (error) {
@@ -496,19 +886,27 @@ async function executeTradePair(
 
     const firstFillPrice = firstResult.price;
     const firstFillSize = firstResult.filledSize;
-    
+    const firstLegFilled = firstResult.filled;
+
+    // Verify first leg actually filled before proceeding
+    if (!firstLegFilled) {
+      log(`⚠️  First leg order not filled - aborting trade pair`, 'WARN');
+      return false;
+    }
+
     state.firstEntryPrice = firstFillPrice;
     state.inPosition = true;
-    
-    log(`✅ ${monitorTokenName} AGGRESSIVE ORDER PLACED @ $${firstFillPrice.toFixed(4)} for ${firstFillSize} shares`, 'TRADE');
+
+    log(`✅ ${monitorTokenName} FILLED @ $${firstFillPrice.toFixed(4)} for ${firstFillSize} shares`, 'TRADE');
 
     // === SECOND LEG: LIMIT ORDER (hedge at complementary price) ===
-    const hedgeLimitPriceRaw = 1 - firstFillPrice;
+    // Hedge at (1 - firstPrice - spread) to capture the target spread profit
+    const hedgeLimitPriceRaw = 1 - firstFillPrice - TARGET_SPREAD_CENTS;
     const hedgeLimitPrice = applyTickSize(hedgeLimitPriceRaw, marketInfo.tickSize);
-    log(`Hedge ${hedgeTokenName} limit: 1 - ${firstFillPrice.toFixed(4)} = ${hedgeLimitPrice.toFixed(4)}`);
+    log(`Hedge ${hedgeTokenName} limit: 1 - ${firstFillPrice.toFixed(2)} - ${TARGET_SPREAD_CENTS.toFixed(2)} = ${hedgeLimitPrice.toFixed(2)} (${TARGET_SPREAD_CENTS * 100}¢ spread)`);
 
-    const hedgeSize = firstFillSize > 0 ? firstFillSize : (targetNotional / Math.max(hedgeLimitPrice, 0.01));
-    const SHARE_SIZE_DYNAMIC = Number(hedgeSize.toFixed(4));
+    // Hedge with same share size as first leg (to maintain balanced position)
+    const hedgeShareSize = firstFillSize;
 
     let hedgeResult: { price: number; orderId: string | null };
     try {
@@ -517,10 +915,10 @@ async function executeTradePair(
         hedgeToken.token_id,
         hedgeTokenName,
         hedgeLimitPrice,
-        SHARE_SIZE_DYNAMIC,
+        hedgeShareSize,
         marketInfo
       );
-      log(`✅ ${hedgeTokenName} LIMIT placed @ $${hedgeLimitPrice.toFixed(4)} for ${SHARE_SIZE_DYNAMIC} shares`, 'TRADE');
+      log(`✅ ${hedgeTokenName} LIMIT placed @ $${hedgeLimitPrice.toFixed(4)} for ${hedgeShareSize} shares`, 'TRADE');
     } catch (error) {
       log(`❌ Failed to place ${hedgeTokenName} hedge limit: ${error}`, 'ERROR');
       log(`   First leg filled but hedge failed!`, 'WARN');
@@ -528,7 +926,8 @@ async function executeTradePair(
     }
 
     // Save trade to store
-    const hedgeSuccess = hedgeResult.orderId !== null;
+    // First leg was verified as filled above, so we can set the filled timestamp
+    const now = Date.now();
     try {
       const trade = addTrade({
         marketSlug: marketSlug,
@@ -538,9 +937,11 @@ async function executeTradePair(
         noOrderId: direction === 'YES_FIRST' ? (hedgeResult.orderId || undefined) : (firstResult.orderId || undefined),
         yesPrice: direction === 'YES_FIRST' ? firstFillPrice : hedgeLimitPrice,
         noPrice: direction === 'YES_FIRST' ? hedgeLimitPrice : firstFillPrice,
-        size: SHARE_SIZE_DYNAMIC,
+        yesFilledAt: direction === 'YES_FIRST' ? now : undefined, // First leg verified filled
+        noFilledAt: direction === 'NO_FIRST' ? now : undefined,   // First leg verified filled
+        size: hedgeShareSize,
         status: 'open',
-        notes: `Market+Limit: ${monitorTokenName} @ $${firstFillPrice.toFixed(4)}`,
+        notes: `${monitorTokenName} FILLED @ $${firstFillPrice.toFixed(4)}, ${hedgeTokenName} limit @ $${hedgeLimitPrice.toFixed(4)}`,
       });
       state.tradeId = trade.id;
       log(`Trade saved: ${trade.id}`, 'TRADE');
@@ -665,18 +1066,18 @@ async function executeAggressiveBuy(
   clobClient: any,
   tokenId: string,
   tokenName: string,
-  dollarAmount: number,
+  shareSize: number,
   marketInfo: { tickSize: string; negRisk: boolean }
-): Promise<{ price: number; orderId: string | null; filledSize: number }> {
-  if (!Number.isFinite(dollarAmount) || dollarAmount <= 0) {
-    throw new Error(`Invalid dollar amount for ${tokenName} buy: ${dollarAmount}`);
+): Promise<{ price: number; orderId: string | null; filledSize: number; filled: boolean }> {
+  if (!Number.isFinite(shareSize) || shareSize <= 0) {
+    throw new Error(`Invalid share size for ${tokenName} buy: ${shareSize}`);
   }
 
   log('='.repeat(60));
   log(`EXECUTING ${tokenName} AGGRESSIVE BUY`, 'TRADE');
   log('='.repeat(60));
   log(`Token ID: ${tokenId.slice(0, 30)}...`);
-  log(`Budget:   $${dollarAmount.toFixed(4)}`);
+  log(`Shares:   ${shareSize}`);
   log('');
 
   try {
@@ -694,18 +1095,25 @@ async function executeAggressiveBuy(
     
     // Add small buffer to ensure we cross the spread (2 cents)
     const aggressivePrice = Math.min(bestAsk + 0.02, 0.99);
-    const finalPrice = applyTickSize(aggressivePrice, marketInfo.tickSize);
-    
-    // Calculate shares based on budget and price
-    const shares = dollarAmount / finalPrice;
-    const roundedShares = Number(shares.toFixed(2));
-    
+    // Ensure price has max 2 decimals (Polymarket requirement for maker amount precision)
+    const tickAdjustedPrice = applyTickSize(aggressivePrice, marketInfo.tickSize);
+    const finalPrice = Math.round(tickAdjustedPrice * 100) / 100;
+
+    // Use the provided share size, but ensure minimum $1.05 order value
+    const MIN_ORDER_VALUE = 1.05;
+    const minSharesForValue = Math.ceil(MIN_ORDER_VALUE / finalPrice);
+    const roundedShares = Math.max(shareSize, minSharesForValue);
+
+    // Calculate order value
+    const orderValue = roundedShares * finalPrice;
+
     log(`Best Ask: $${bestAsk.toFixed(4)}`);
-    log(`Aggressive Price: $${finalPrice.toFixed(4)} (+$0.02 buffer)`);
-    log(`Shares: ${roundedShares}`);
+    log(`Aggressive Price: $${finalPrice.toFixed(2)} (+$0.02 buffer)`);
+    log(`Shares: ${roundedShares} (order value: $${orderValue.toFixed(2)})`);
     log('');
 
-    // Place GTC order at aggressive price - should fill immediately against asks
+    // Place FOK (Fill or Kill) order - guarantees immediate fill or rejection
+    // This ensures we don't leave unfilled orders on the book
     const response = await clobClient.createAndPostOrder(
       {
         tokenID: tokenId,
@@ -718,7 +1126,7 @@ async function executeAggressiveBuy(
         tickSize: marketInfo.tickSize,
         negRisk: marketInfo.negRisk,
       },
-      OrderType.GTC
+      OrderType.FOK
     );
 
     if (!response) {
@@ -738,24 +1146,67 @@ async function executeAggressiveBuy(
 
     const orderId = response?.order_id || response?.orderID || response?.id || null;
     const status = response?.status || 'UNKNOWN';
-    
+
     // Verify we got a valid order ID
     if (!orderId) {
       log(`⚠️  Order may not have been placed - no order ID returned`, 'WARN');
       log(`Response: ${JSON.stringify(response).slice(0, 200)}`, 'WARN');
+      throw new Error('No order ID returned - order may not have been placed');
     }
-    
-    log(`✅ AGGRESSIVE ORDER PLACED!`, 'TRADE');
-    log(`Order ID: ${orderId || 'N/A'}`);
-    log(`Status: ${status}`);
-    log(`Price: $${finalPrice.toFixed(4)}`);
-    log(`Size: ${roundedShares} shares`);
+
+    log(`Order placed - ID: ${orderId}`, 'TRADE');
+    log(`Initial status: ${status}`);
+
+    // Verify order was filled by checking order status
+    // For FOK orders, if we get an order ID, it should be filled
+    // But we verify to be sure
+    let filled = false;
+    let filledPrice = finalPrice;
+    let actualFilledSize = roundedShares;
+
+    try {
+      // Wait a moment for order to be processed
+      await new Promise(resolve => setTimeout(resolve, 500));
+
+      // Check order status
+      const orderInfo = await clobClient.getOrder(orderId);
+      log(`Order status check: ${JSON.stringify(orderInfo).slice(0, 200)}`);
+
+      if (orderInfo) {
+        const orderStatus = orderInfo.status || orderInfo.order_status || '';
+        const sizeFilled = parseFloat(orderInfo.size_matched || orderInfo.filled_size || '0');
+        const avgPrice = parseFloat(orderInfo.average_price || orderInfo.price || finalPrice.toString());
+
+        if (orderStatus.toUpperCase() === 'MATCHED' || orderStatus.toUpperCase() === 'FILLED') {
+          filled = true;
+          actualFilledSize = sizeFilled > 0 ? sizeFilled : roundedShares;
+          filledPrice = avgPrice > 0 ? avgPrice : finalPrice;
+          log(`✅ ORDER FILLED! Size: ${actualFilledSize}, Avg Price: $${filledPrice.toFixed(4)}`, 'TRADE');
+        } else if (orderStatus.toUpperCase() === 'LIVE' || orderStatus.toUpperCase() === 'OPEN') {
+          log(`⚠️  Order is LIVE/OPEN - not filled yet`, 'WARN');
+          filled = false;
+        } else {
+          log(`Order status: ${orderStatus}`, 'INFO');
+          // For FOK, if order was accepted it should be filled
+          filled = orderId !== null;
+        }
+      }
+    } catch (e) {
+      log(`⚠️  Could not verify order status: ${e}`, 'WARN');
+      // For FOK orders, if we got an order ID without error, assume filled
+      filled = true;
+    }
+
+    log(`Price: $${filledPrice.toFixed(4)}`);
+    log(`Size: ${actualFilledSize} shares`);
+    log(`Filled: ${filled ? 'YES' : 'NO'}`);
     log('='.repeat(60));
 
-    return { 
-      price: finalPrice,
-      orderId, 
-      filledSize: roundedShares 
+    return {
+      price: filledPrice,
+      orderId,
+      filledSize: actualFilledSize,
+      filled
     };
   } catch (error) {
     log(`❌ Failed to execute ${tokenName} aggressive buy: ${error}`, 'ERROR');
@@ -990,7 +1441,7 @@ async function main() {
   log(`Private Key:     ${hasPrivateKey ? '✓ Set (real trading enabled)' : '✗ Missing (simulation only)'}`);
   log(`Market Slug:     ${MARKET_SLUG}`);
   log(`Trailing Stop:   ${TRAILING_STOP_CENTS * 100} cents`);
-  log(`Target Notional: $${TARGET_NOTIONAL_PER_LEG}`);
+  log(`Share Size:      ${SHARE_SIZE} shares per leg`);
   console.log('');
 
   // Validate private key is set for real trading
@@ -1033,57 +1484,70 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
       throw new Error(`ClobClient not properly loaded. Type: ${typeof ClobClient}, Value: ${ClobClient}`);
     }
 
+    // Polymarket Proxy Wallet (smart account) - funds are held here
+    // Signature types: 0 = EOA, 1 = Poly Proxy (MagicLink), 2 = Gnosis Safe (MetaMask)
+    const signatureType = 2; // 2 = Gnosis Safe (your wallet is a Gnosis Safe v1.3.0)
+    const funder = "0x2163f00898fb58f47573e89940ff728a5e07ac09";
+
     // Use existing API credentials or create/derive new ones
     let creds: any;
     let apiKeyCreated = false;
-    
-    // First, check if user provided API credentials in .env.local
-    if (hasCredentials) {
-      log(`Using API credentials from .env.local`);
-      // Format credentials for ClobClient
-      // The SDK expects: { apiKey, apiSecret, passphrase } or similar format
-      creds = {
-        key: POLYMARKET_API_KEY,
-        secret: POLYMARKET_SECRET,
-        passphrase: POLYMARKET_PASSPHRASE,
-      };
-      apiKeyCreated = true;
-      log(`✅ Using provided API credentials`);
-    } else {
-      // Try to create/derive API key using SDK
-      log(`No API credentials found in .env.local, attempting to create/derive API key...`);
-      try {
-        const tempClient = new ClobClient(CLOB_HOST, 137, signer);
-        const apiKeyPromise = tempClient.createOrDeriveApiKey();
-        creds = await apiKeyPromise; // Await the promise
-        
-        // Check if creds is valid (should have apiKey and apiSecret properties)
-        if (creds && (creds.apiKey || creds.api_key)) {
+
+    // Always try to derive fresh API credentials using the SDK
+    // IMPORTANT: Must derive with signatureType and funder set for proxy wallet
+    log(`Deriving fresh API credentials using SDK...`);
+    log(`   Using proxy wallet: ${funder}`);
+    try {
+      // Create temp client WITH funder and signatureType to derive correct credentials
+      const tempClient = new ClobClient(CLOB_HOST, 137, signer, undefined, signatureType, funder);
+      const derivedCreds = await tempClient.createOrDeriveApiKey();
+      
+      // Check if creds is valid (should have apiKey and apiSecret properties)
+      if (derivedCreds && (derivedCreds.apiKey || derivedCreds.key)) {
+        creds = derivedCreds;
+        apiKeyCreated = true;
+        log(`✅ API credentials derived successfully`);
+        log(`   API Key: ${(derivedCreds.apiKey || derivedCreds.key || '').slice(0, 10)}...`);
+      } else {
+        log(`⚠️  API key derivation returned unexpected format`, 'WARN');
+        log(`   Response keys: ${Object.keys(derivedCreds || {}).join(', ')}`);
+        // Fall back to .env.local credentials if available
+        if (hasCredentials) {
+          log(`   Falling back to .env.local credentials`);
+          creds = {
+            key: POLYMARKET_API_KEY,
+            secret: POLYMARKET_SECRET,
+            passphrase: POLYMARKET_PASSPHRASE,
+          };
           apiKeyCreated = true;
-          log(`✅ API key created/derived successfully`);
         } else {
-          log(`⚠️  API key creation returned invalid credentials`, 'WARN');
           creds = null;
         }
-      } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        log(`❌ API key creation failed: ${errorMsg}`, 'ERROR');
-        log(`   The SDK may have logged additional details above`, 'WARN');
+      }
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      log(`⚠️  API key derivation failed: ${errorMsg}`, 'WARN');
+      
+      // Fall back to .env.local credentials if available
+      if (hasCredentials) {
+        log(`   Falling back to .env.local credentials`);
+        creds = {
+          key: POLYMARKET_API_KEY,
+          secret: POLYMARKET_SECRET,
+          passphrase: POLYMARKET_PASSPHRASE,
+        };
+        apiKeyCreated = true;
+      } else {
+        log(`   No fallback credentials available`, 'WARN');
         log(`   Common causes:`, 'WARN');
         log(`   - Wallet not registered/verified on Polymarket`, 'WARN');
         log(`   - Wallet needs to complete account setup on polymarket.com`, 'WARN');
         log(`   - Rate limiting or temporary API issues`, 'WARN');
-        log(`   Continuing without API key - trading operations will likely fail`, 'WARN');
-        // Try to continue without API key (may work for some operations)
         creds = null;
       }
     }
 
-    // Initialize ClobClient
-    // Signature type: 0 = Browser Wallet, 1 = Magic/Email Login
-    const signatureType = 0; // 0 = EOA wallet (private key)
-    const funder = undefined; // Optional: Polymarket Profile Address for USDC deposits
-    
+    // Initialize ClobClient with proxy wallet configuration
     try {
       // @ts-ignore - ClobClient API
       clobClient = new ClobClient(CLOB_HOST, 137, signer, creds, signatureType, funder);
@@ -1235,6 +1699,18 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
   console.log('');
 
   // -------------------------------------------------------------------------
+  // STEP 4: Connect to WebSocket for real-time price updates
+  // -------------------------------------------------------------------------
+  log('STEP 4: Connecting to WebSocket for real-time prices...');
+  try {
+    await connectWebSocket(yesToken.token_id, noToken.token_id);
+    log('✅ WebSocket connected - using real-time price feed');
+  } catch (error) {
+    log(`⚠️ WebSocket connection failed, will use REST API fallback: ${error}`, 'WARN');
+  }
+  console.log('');
+
+  // -------------------------------------------------------------------------
   // STEP 5: Initialize trade state
   // -------------------------------------------------------------------------
   log('STEP 5: Initializing trade state...');
@@ -1293,11 +1769,57 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
   let noStaleCount = 0;
   const STALE_ORDERBOOK_CHECK_CYCLES = 30;
 
+  // Track if this is the first trade on a new market (execute immediately, no trailing stop)
+  // Check if there are existing open trades for this market - if so, don't treat as "new market"
+  const existingTrades = getTrades({ marketSlug: currentMarketSlug, status: 'open' });
+  let isFirstTradeOnMarket = existingTrades.length === 0;
+
+  if (existingTrades.length > 0) {
+    log(`Found ${existingTrades.length} existing open trade(s) for this market - resuming`, 'INFO');
+    // Set inPosition flags based on existing trades
+    const hasYesFirstTrade = existingTrades.some(t => t.yesFilledAt && !t.noFilledAt);
+    const hasNoFirstTrade = existingTrades.some(t => t.noFilledAt && !t.yesFilledAt);
+    if (hasYesFirstTrade) {
+      dualState.yesFirstState.inPosition = true;
+      log(`YES_FIRST has pending hedge - resuming position`, 'INFO');
+    }
+    if (hasNoFirstTrade) {
+      dualState.noFirstState.inPosition = true;
+      log(`NO_FIRST has pending hedge - resuming position`, 'INFO');
+    }
+  } else {
+    log(`No existing trades for this market - will execute first trades immediately`, 'INFO');
+  }
+
   while (true) {
     cycleCount++;
     log(`═══ CYCLE ${cycleCount} ═══`);
     console.log('');
-    
+
+    // ---------------------------------------------------------------------
+    // STOP LOSS CHECK - Track profit, not cash balance
+    // ---------------------------------------------------------------------
+    if (MAX_LOSS_USD !== null) {
+      const totalPnL = getTotalPnL();
+      log(`Total P&L: $${totalPnL.toFixed(2)}`, totalPnL < 0 ? 'WARN' : 'INFO');
+
+      if (totalPnL < MAX_LOSS_USD) {
+        log('');
+        log('╔════════════════════════════════════════════════════════════╗', 'ERROR');
+        log('║  🛑 STOP LOSS TRIGGERED - STOPPING TRADING                 ║', 'ERROR');
+        log('╠════════════════════════════════════════════════════════════╣', 'ERROR');
+        log(`║  Total P&L: $${totalPnL.toFixed(2)}                                        ║`, 'ERROR');
+        log(`║  Max Loss:  $${MAX_LOSS_USD.toFixed(2)}                                        ║`, 'ERROR');
+        log('╚════════════════════════════════════════════════════════════╝', 'ERROR');
+        log('');
+
+        // Cancel all open orders before exiting
+        await cancelAllOpenOrders(clobClient);
+        log('Cancelled all open orders. Exiting...', 'ERROR');
+        process.exit(1);
+      }
+    }
+
     // Display trade pairs table periodically
     if (cycleCount % TABLE_DISPLAY_INTERVAL === 0 || cycleCount === 1) {
       displayTradePairsTable(currentMarketSlug);
@@ -1381,7 +1903,22 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
                 log(`Market expires at: ${newEndDate.toISOString()}`, 'INFO');
               }
               console.log('');
-              
+
+              // Reset first trade flag for new market (execute immediately on first trade)
+              isFirstTradeOnMarket = true;
+              log(`🚀 First trade on new market will execute immediately (no trailing stop)`, 'TRADE');
+
+              // Reconnect WebSocket to new market tokens
+              try {
+                if (wsConnection) {
+                  wsConnection.close();
+                }
+                await connectWebSocket(yesToken.token_id, noToken.token_id);
+                log('✅ WebSocket reconnected for new market');
+              } catch (error) {
+                log(`⚠️ WebSocket reconnection failed: ${error}`, 'WARN');
+              }
+
               // Continue to next cycle to start trading new market
               await sleep(LOOP_INTERVAL_MS);
               continue;
@@ -1405,7 +1942,7 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
       }
 
       // ---------------------------------------------------------------------
-      // 6b: Fetch current prices for both tokens (for dual mode)
+      // 6b: Fetch current prices for both tokens (via WebSocket or REST fallback)
       // ---------------------------------------------------------------------
       log('Fetching current token prices...');
 
@@ -1414,32 +1951,26 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
       let priceFetchError = false;
 
       try {
-        [yesPrice, noPrice] = await Promise.all([
-          getMidpoint(yesToken.token_id).catch((error) => {
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            log(`⚠️  Failed to fetch YES price: ${errorMsg}`, 'WARN');
-            
-            // Check if it's a 404 (orderbook doesn't exist) - market might be settling
-            if (errorMsg.includes('404') || errorMsg.includes('No orderbook exists')) {
-              log(`YES orderbook unavailable - market may be settling`, 'INFO');
-              priceFetchError = true;
-            }
-            return null;
-          }),
-          getMidpoint(noToken.token_id).catch((error) => {
-            const errorMsg = error instanceof Error ? error.message : String(error);
-            log(`⚠️  Failed to fetch NO price: ${errorMsg}`, 'WARN');
-            
-            // Check if it's a 404 (orderbook doesn't exist) - market might be settling
-            if (errorMsg.includes('404') || errorMsg.includes('No orderbook exists')) {
-              log(`NO orderbook unavailable - market may be settling`, 'INFO');
-              priceFetchError = true;
-            }
-            return null;
-          }),
-        ]);
+        // Use WebSocket prices if available, fallback to REST API
+        const prices = await getCurrentPrices(yesToken.token_id, noToken.token_id);
+        yesPrice = prices.yesPrice;
+        noPrice = prices.noPrice;
+
+        // Log source
+        const isWebSocketData = Date.now() - priceState.lastUpdate < 5000;
+        if (isWebSocketData) {
+          log(`📡 Using WebSocket real-time prices`);
+        } else {
+          log(`🔄 Using REST API prices (WebSocket stale)`);
+        }
       } catch (error) {
-        log(`⚠️  Error fetching prices: ${error}`, 'WARN');
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        log(`⚠️  Error fetching prices: ${errorMsg}`, 'WARN');
+
+        // Check if it's a 404 (orderbook doesn't exist) - market might be settling
+        if (errorMsg.includes('404') || errorMsg.includes('No orderbook exists')) {
+          log(`Orderbook unavailable - market may be settling`, 'INFO');
+        }
         priceFetchError = true;
       }
 
@@ -1519,18 +2050,78 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
       }
 
       // ---------------------------------------------------------------------
-      // 6b: Execute trades based on mode
+      // 6b: Check pending hedge orders and update fill status
+      // ---------------------------------------------------------------------
+      const hedgesFilled = await checkAndUpdatePendingHedges(clobClient, currentMarketSlug);
+      if (hedgesFilled > 0) {
+        log(`${hedgesFilled} hedge order(s) filled this cycle`, 'TRADE');
+
+        // Reset inPosition flags so new trades can be opened
+        // Check which direction's hedge just filled and reset that state
+        if (TRADE_MODE === 'DUAL') {
+          // Reset YES_FIRST state if its trade is now fully filled
+          if (dualState.yesFirstState.inPosition && dualState.yesFirstState.tradeId) {
+            const yesFirstTrades = getTrades({ marketSlug: currentMarketSlug, status: 'filled' });
+            const isYesFirstFilled = yesFirstTrades.some(t => t.id === dualState.yesFirstState.tradeId);
+            if (isYesFirstFilled) {
+              log(`YES_FIRST trade ${dualState.yesFirstState.tradeId?.slice(-6)} fully hedged - ready for new trade`, 'TRADE');
+              dualState.yesFirstState.inPosition = false;
+              dualState.yesFirstState.firstEntryPrice = null;
+              dualState.yesFirstState.secondOrderPrice = null;
+              dualState.yesFirstState.peakPrice = 0;
+              dualState.yesFirstState.tradeId = undefined;
+            }
+          }
+
+          // Reset NO_FIRST state if its trade is now fully filled
+          if (dualState.noFirstState.inPosition && dualState.noFirstState.tradeId) {
+            const noFirstTrades = getTrades({ marketSlug: currentMarketSlug, status: 'filled' });
+            const isNoFirstFilled = noFirstTrades.some(t => t.id === dualState.noFirstState.tradeId);
+            if (isNoFirstFilled) {
+              log(`NO_FIRST trade ${dualState.noFirstState.tradeId?.slice(-6)} fully hedged - ready for new trade`, 'TRADE');
+              dualState.noFirstState.inPosition = false;
+              dualState.noFirstState.firstEntryPrice = null;
+              dualState.noFirstState.secondOrderPrice = null;
+              dualState.noFirstState.peakPrice = 0;
+              dualState.noFirstState.tradeId = undefined;
+            }
+          }
+        } else {
+          // SINGLE mode - reset state if trade is fully filled
+          if (state.inPosition && state.tradeId) {
+            const singleTrades = getTrades({ marketSlug: currentMarketSlug, status: 'filled' });
+            const isSingleFilled = singleTrades.some(t => t.id === state.tradeId);
+            if (isSingleFilled) {
+              log(`Trade ${state.tradeId?.slice(-6)} fully hedged - ready for new trade`, 'TRADE');
+              state.inPosition = false;
+              state.firstEntryPrice = null;
+              state.secondOrderPrice = null;
+              state.peakPrice = 0;
+              state.tradeId = undefined;
+            }
+          }
+        }
+      }
+
+      // ---------------------------------------------------------------------
+      // 6c: Execute trades based on mode
+      // RULE: Only ONE unhedged trade per side PER MARKET
+      // New market = fresh start, execute immediately
       // ---------------------------------------------------------------------
       if (TRADE_MODE === 'DUAL') {
-        // DUAL MODE: Monitor both YES and NO simultaneously
-        
-        // Check YES_FIRST pair (monitor YES price)
-        if (!dualState.yesFirstState.inPosition) {
-          try {
-            const { triggered, newPeak } = calculateTrailingStop(yesPrice, dualState.yesFirstState.peakPrice);
-            dualState.yesFirstState.peakPrice = newPeak;
+        // DUAL MODE: Monitor both YES and NO independently
 
-        if (triggered) {
+        // Check hedge status for CURRENT MARKET ONLY
+        const yesFirstHedged = isYesFirstFullyHedged(currentMarketSlug);
+        const noFirstHedged = isNoFirstFullyHedged(currentMarketSlug);
+
+        // FIRST TRADE ON NEW MARKET: Execute immediately (fresh start)
+        if (isFirstTradeOnMarket) {
+          log(`🚀 NEW MARKET - Executing first trades immediately!`, 'TRADE');
+
+          // Execute YES_FIRST
+          if (!dualState.yesFirstState.inPosition) {
+            try {
               const success = await executeTradePair(
                 clobClient,
                 'YES_FIRST',
@@ -1543,29 +2134,19 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
                 currentMarketSlug,
                 marketInfo
               );
-              
+
               if (!success) {
-                // Trade failed - reset state to allow retry
-                log(`YES_FIRST trade failed, resetting state for retry`, 'WARN');
+                log(`YES_FIRST immediate trade failed`, 'WARN');
                 dualState.yesFirstState.inPosition = false;
-                dualState.yesFirstState.firstEntryPrice = null;
-                dualState.yesFirstState.secondOrderPrice = null;
               }
-              // Don't reset peak - allow multiple entries on success
+            } catch (error) {
+              log(`⚠️  Error executing YES_FIRST: ${error}`, 'WARN');
             }
-          } catch (error) {
-            log(`⚠️  Error processing YES_FIRST pair: ${error}`, 'WARN');
-            // Continue to NO_FIRST pair
           }
-        }
 
-        // Check NO_FIRST pair (monitor NO price)
-        if (!dualState.noFirstState.inPosition) {
-          try {
-            const { triggered, newPeak } = calculateTrailingStop(noPrice, dualState.noFirstState.peakPrice);
-            dualState.noFirstState.peakPrice = newPeak;
-
-            if (triggered) {
+          // Execute NO_FIRST
+          if (!dualState.noFirstState.inPosition) {
+            try {
               const success = await executeTradePair(
                 clobClient,
                 'NO_FIRST',
@@ -1578,19 +2159,86 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
                 currentMarketSlug,
                 marketInfo
               );
-              
+
               if (!success) {
-                // Trade failed - reset state to allow retry
-                log(`NO_FIRST trade failed, resetting state for retry`, 'WARN');
+                log(`NO_FIRST immediate trade failed`, 'WARN');
                 dualState.noFirstState.inPosition = false;
-                dualState.noFirstState.firstEntryPrice = null;
-                dualState.noFirstState.secondOrderPrice = null;
               }
-              // Don't reset peak - allow multiple entries on success
+            } catch (error) {
+              log(`⚠️  Error executing NO_FIRST: ${error}`, 'WARN');
             }
-          } catch (error) {
-            log(`⚠️  Error processing NO_FIRST pair: ${error}`, 'WARN');
-            // Continue execution
+          }
+
+          isFirstTradeOnMarket = false;
+          log(`First trades executed. Now using trailing stop for subsequent trades.`, 'INFO');
+
+        } else {
+          // SUBSEQUENT TRADES: Check hedge status before allowing new trades
+
+          // === YES_FIRST SIDE ===
+          if (!yesFirstHedged) {
+            log(`⏳ YES_FIRST: Waiting for hedge to fill`, 'INFO');
+          } else if (!dualState.yesFirstState.inPosition) {
+            // Hedge filled, can start new trade with trailing stop
+            const { triggered, newPeak } = calculateTrailingStop(yesPrice, dualState.yesFirstState.peakPrice);
+            dualState.yesFirstState.peakPrice = newPeak;
+
+            if (triggered) {
+              log(`YES_FIRST trailing stop triggered!`, 'TRADE');
+              try {
+                const success = await executeTradePair(
+                  clobClient,
+                  'YES_FIRST',
+                  yesToken,
+                  noToken,
+                  yesPrice,
+                  yesPrice,
+                  noPrice,
+                  dualState.yesFirstState,
+                  currentMarketSlug,
+                  marketInfo
+                );
+
+                if (!success) {
+                  dualState.yesFirstState.inPosition = false;
+                }
+              } catch (error) {
+                log(`⚠️  Error processing YES_FIRST: ${error}`, 'WARN');
+              }
+            }
+          }
+
+          // === NO_FIRST SIDE ===
+          if (!noFirstHedged) {
+            log(`⏳ NO_FIRST: Waiting for hedge to fill`, 'INFO');
+          } else if (!dualState.noFirstState.inPosition) {
+            // Hedge filled, can start new trade with trailing stop
+            const { triggered, newPeak } = calculateTrailingStop(noPrice, dualState.noFirstState.peakPrice);
+            dualState.noFirstState.peakPrice = newPeak;
+
+            if (triggered) {
+              log(`NO_FIRST trailing stop triggered!`, 'TRADE');
+              try {
+                const success = await executeTradePair(
+                  clobClient,
+                  'NO_FIRST',
+                  yesToken,
+                  noToken,
+                  noPrice,
+                  yesPrice,
+                  noPrice,
+                  dualState.noFirstState,
+                  currentMarketSlug,
+                  marketInfo
+                );
+
+                if (!success) {
+                  dualState.noFirstState.inPosition = false;
+                }
+              } catch (error) {
+                log(`⚠️  Error processing NO_FIRST: ${error}`, 'WARN');
+              }
+            }
           }
         }
 
@@ -1748,8 +2396,121 @@ let marketInfo: { tickSize: string; negRisk: boolean } = { tickSize: '0.01', neg
 }
 
 // ============================================================================
+// HOURLY CLAIM CHECK
+// ============================================================================
+
+const DATA_HOST = 'https://data-api.polymarket.com';
+const CTF_ADDRESS_CHECK = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+const USDC_ADDRESS_CHECK = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const POLYGON_RPC_CHECK = 'https://polygon-rpc.com';
+
+// Track last claim check time
+let lastClaimCheckTime = 0;
+const CLAIM_CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+
+/**
+ * Check for claimable positions and display notification
+ */
+async function checkClaimablePositions(): Promise<void> {
+  const now = Date.now();
+
+  // Only run once per hour
+  if (now - lastClaimCheckTime < CLAIM_CHECK_INTERVAL_MS) {
+    return;
+  }
+
+  lastClaimCheckTime = now;
+
+  log('');
+  log('═'.repeat(60));
+  log('HOURLY CLAIM CHECK', 'TRADE');
+  log('═'.repeat(60));
+
+  try {
+    // Fetch positions from Data API
+    const funderAddress = '0x2163f00898fb58f47573e89940ff728a5e07ac09';
+    const res = await fetch(`${DATA_HOST}/positions?user=${funderAddress}`);
+
+    if (!res.ok) {
+      log('Could not fetch positions for claim check', 'WARN');
+      return;
+    }
+
+    const positions = await res.json();
+
+    if (!positions || positions.length === 0) {
+      log('No positions to check', 'INFO');
+      return;
+    }
+
+    // Group by condition ID
+    const conditionIds = new Set<string>();
+    for (const pos of positions) {
+      if (pos.conditionId || pos.condition_id) {
+        conditionIds.add(pos.conditionId || pos.condition_id);
+      }
+    }
+
+    let resolvedCount = 0;
+    let totalClaimable = 0;
+
+    for (const conditionId of conditionIds) {
+      // Check if market is resolved
+      const gammaRes = await fetch(`${GAMMA_HOST}/markets?condition_id=${conditionId}`);
+      if (!gammaRes.ok) continue;
+
+      const markets = await gammaRes.json();
+      const market = markets?.[0];
+
+      if (market?.closed || market?.resolved) {
+        resolvedCount++;
+
+        // Get balance (simplified - sum position sizes)
+        const positionsForCondition = positions.filter(
+          (p: any) => (p.conditionId || p.condition_id) === conditionId
+        );
+        const totalSize = positionsForCondition.reduce(
+          (sum: number, p: any) => sum + parseFloat(p.size || p.amount || '0'),
+          0
+        );
+        totalClaimable += totalSize;
+      }
+    }
+
+    if (resolvedCount > 0) {
+      log('');
+      log('╔════════════════════════════════════════════════════════════╗', 'TRADE');
+      log('║  💰 CLAIMABLE WINNINGS AVAILABLE!                          ║', 'TRADE');
+      log('╠════════════════════════════════════════════════════════════╣', 'TRADE');
+      log(`║  Resolved Markets: ${resolvedCount}                                       ║`, 'TRADE');
+      log(`║  Estimated Value:  ~$${totalClaimable.toFixed(2)} USDC                           ║`, 'TRADE');
+      log('╠════════════════════════════════════════════════════════════╣', 'TRADE');
+      log('║  Claim at: https://polymarket.com/portfolio                ║', 'TRADE');
+      log('╚════════════════════════════════════════════════════════════╝', 'TRADE');
+      log('');
+    } else {
+      log('No claimable positions found', 'INFO');
+    }
+
+  } catch (error) {
+    log(`Claim check error: ${error}`, 'WARN');
+  }
+
+  log('═'.repeat(60));
+  log('');
+}
+
+// ============================================================================
 // RUN STRATEGY
 // ============================================================================
+
+// Run initial claim check on startup
+checkClaimablePositions().catch(() => {});
+
+// Schedule hourly claim checks (runs in background during main loop)
+setInterval(() => {
+  checkClaimablePositions().catch(() => {});
+}, CLAIM_CHECK_INTERVAL_MS);
 
 main().catch((error) => {
   log(`Fatal error: ${error}`, 'ERROR');

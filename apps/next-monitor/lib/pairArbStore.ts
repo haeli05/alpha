@@ -130,6 +130,102 @@ export function getTradeStats(): {
  * Cancel all pending trades for a market, unless one leg is already executed
  * Returns the number of trades cancelled
  */
+/**
+ * Get trades that have one leg filled but the other pending
+ * These are trades waiting for their hedge to execute
+ */
+export function getPartiallyFilledTrades(marketSlug?: string): PairArbTrade[] {
+  const store = readStore();
+  return store.trades.filter((t) => {
+    if (t.status !== 'open') return false;
+    if (marketSlug && t.marketSlug !== marketSlug) return false;
+
+    const hasYesFilled = !!t.yesFilledAt;
+    const hasNoFilled = !!t.noFilledAt;
+
+    // Return trades where exactly one leg is filled
+    return (hasYesFilled && !hasNoFilled) || (!hasYesFilled && hasNoFilled);
+  });
+}
+
+/**
+ * Check if all open trades for a market are fully hedged (both legs filled)
+ */
+export function areAllTradesFullyHedged(marketSlug?: string): boolean {
+  const partialTrades = getPartiallyFilledTrades(marketSlug);
+  return partialTrades.length === 0;
+}
+
+/**
+ * Check if YES_FIRST trades are fully hedged (no pending YES_FIRST hedges)
+ * YES_FIRST = YES filled first, NO pending
+ */
+export function isYesFirstFullyHedged(marketSlug?: string): boolean {
+  const partialTrades = getPartiallyFilledTrades(marketSlug);
+  // YES_FIRST trades have yesFilledAt set but not noFilledAt
+  const pendingYesFirst = partialTrades.filter(t => t.yesFilledAt && !t.noFilledAt);
+  return pendingYesFirst.length === 0;
+}
+
+/**
+ * Check if NO_FIRST trades are fully hedged (no pending NO_FIRST hedges)
+ * NO_FIRST = NO filled first, YES pending
+ */
+export function isNoFirstFullyHedged(marketSlug?: string): boolean {
+  const partialTrades = getPartiallyFilledTrades(marketSlug);
+  // NO_FIRST trades have noFilledAt set but not yesFilledAt
+  const pendingNoFirst = partialTrades.filter(t => t.noFilledAt && !t.yesFilledAt);
+  return pendingNoFirst.length === 0;
+}
+
+/**
+ * Mark the hedge leg of a trade as filled
+ */
+export function markHedgeFilled(tradeId: string, side: 'yes' | 'no'): PairArbTrade | null {
+  const store = readStore();
+  const trade = store.trades.find((t) => t.id === tradeId);
+  if (!trade) return null;
+
+  if (side === 'yes') {
+    trade.yesFilledAt = Date.now();
+  } else {
+    trade.noFilledAt = Date.now();
+  }
+
+  // Check if both legs are now filled
+  if (trade.yesFilledAt && trade.noFilledAt) {
+    trade.status = 'filled';
+    // Calculate realized PnL: profit = (1.00 - yesPrice - noPrice) * size
+    trade.realizedPnl = (1.0 - trade.yesPrice - trade.noPrice) * trade.size;
+    trade.notes = (trade.notes || '') + ` | Both legs filled | PnL: $${trade.realizedPnl.toFixed(4)}`;
+  }
+
+  writeStore(store);
+  return trade;
+}
+
+/**
+ * Calculate total profit from all filled trades
+ */
+export function getTotalProfit(): number {
+  const store = readStore();
+  return store.trades
+    .filter((t) => t.status === 'filled')
+    .reduce((sum, t) => {
+      if (t.realizedPnl !== undefined) {
+        return sum + t.realizedPnl;
+      }
+      return sum + (1.0 - t.yesPrice - t.noPrice) * t.size;
+    }, 0);
+}
+
+/**
+ * Get total PnL (realized from filled trades)
+ */
+export function getTotalPnL(): number {
+  return getTotalProfit();
+}
+
 export function cancelPendingTradesForMarket(marketSlug: string): number {
   const store = readStore();
   let cancelledCount = 0;
@@ -160,6 +256,7 @@ export function cancelPendingTradesForMarket(marketSlug: string): number {
   
   return cancelledCount;
 }
+
 
 
 
