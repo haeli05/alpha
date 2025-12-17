@@ -1,3 +1,5 @@
+Droplet 138.197.132.207
+
 # Polymarket Trading Scripts
 
 Trading automation scripts for Polymarket.
@@ -56,3 +58,47 @@ To trade, you need your wallet's private key:
 - Use a dedicated wallet with limited funds for bot trading
 - Never commit `.env.local` to git
 - The private key gives full access to your wallet funds
+
+
+#### VPS Setup:
+
+
+⏺ Here's how to set it up on your Ubuntu droplet, master:
+
+  1. SSH into your droplet:
+  ssh root@YOUR_DROPLET_IP
+
+  2. Install Node.js 20:
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+  apt-get install -y nodejs
+
+  3. Install pm2 (keeps script running):
+  npm install -g pm2
+
+  4. Clone your repo:
+  cd /root
+  git clone YOUR_REPO_URL alpha
+  cd alpha/apps/next-monitor
+
+  5. Create .env.local:
+  nano .env.local
+  Add:
+  POLYMARKET_API_KEY=your_key
+  POLYMARKET_SECRET=your_secret
+  POLYMARKET_PASSPHRASE=your_passphrase
+  POLYMARKET_PRIVATE_KEY=your_private_key
+
+  6. Install dependencies:
+  npm install
+
+  7. Run with pm2:
+  pm2 start "npx tsx scripts/polymarket/copy-trade.ts" --name copy-trade
+
+  Useful pm2 commands:
+  pm2 logs copy-trade     # View logs
+  pm2 status              # Check status
+  pm2 restart copy-trade  # Restart
+  pm2 stop copy-trade     # Stop
+  pm2 save                # Save for reboot
+  pm2 startup             # Auto-start on reboot
+
